@@ -1,108 +1,159 @@
 import 'package:flutter/material.dart';
-import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
 
 import '../models/barber.dart';
-import '../models/barber_query.dart';
-import '../state/barber_list_notifier.dart';
-import '../widgets/app_scaffold.dart';
-import '../widgets/debounced_text_field.dart';
-import '../widgets/entity_list_view.dart';
+import '../models/common.dart';
+import '../state/notifiers.dart';
+import '../validators.dart';
+import '../widgets/common.dart';
+import '../widgets/entity_form.dart';
 import '../widgets/entity_table.dart';
+import 'simple_screen.dart';
 
-class BarbersScreen extends StatefulWidget {
-  final BarberQuery query;
+Widget barbersList(Map<String, String> params) =>
+    SimpleListScreen<Barber, BarberListNotifier>(
+      title: 'Барберы',
+      query: SimpleQuery.fromParams(
+        '/barbers',
+        BarberListNotifier.barberSort,
+        params,
+      ),
+      searchLabel: 'Поиск по ФИО',
+      nameOf: (b) => b.fullName,
+      columns: (n) => [
+        TableColumnSpec(
+          label: '№',
+          sortField: 'id',
+          numeric: true,
+          build: (b) => Text('${b.id}'),
+        ),
+        TableColumnSpec(
+          label: 'ФИО',
+          sortField: 'fullName',
+          build: (b) => Text(b.fullName),
+        ),
+        TableColumnSpec(
+          label: 'Год рождения',
+          sortField: 'birthYear',
+          numeric: true,
+          build: (b) => Text('${b.birthYear}'),
+        ),
+        TableColumnSpec(label: 'Филиал', build: (b) => Text(n.branchName(b))),
+      ],
+    );
 
-  const BarbersScreen({super.key, required this.query});
+Widget barberDetail(int id) => SimpleDetailScreen<Barber, BarberListNotifier>(
+  id: id,
+  title: 'Карточка барбера',
+  backPath: '/barbers',
+  notFoundText: 'Барбер $id не найден',
+  rows: (context, n, b) => [
+    Text(b.fullName, style: Theme.of(context).textTheme.headlineSmall),
+    const SizedBox(height: 12),
+    DetailRow.text('Год рождения', '${b.birthYear}'),
+    DetailRow.text('Филиал', n.branchName(b)),
+  ],
+);
+
+class BarberFormScreen extends StatefulWidget {
+  final int? id;
+
+  const BarberFormScreen({super.key, this.id});
+
+  bool get isEditing => id != null;
 
   @override
-  State<BarbersScreen> createState() => _BarbersScreenState();
+  State<BarberFormScreen> createState() => _BarberFormScreenState();
 }
 
-class _BarbersScreenState extends State<BarbersScreen> {
+class _BarberFormScreenState extends State<BarberFormScreen> {
+  final _fullName = TextEditingController();
+  final _birthYear = TextEditingController();
+  int? _branchId;
+  Barber? _original;
+  bool _loading = false;
+  String? _notFound;
+
   @override
   void initState() {
     super.initState();
-    _sync();
+    if (widget.isEditing) {
+      _loading = true;
+      context.read<BarberListNotifier>().findById(widget.id!).then((b) {
+        if (!mounted) return;
+        setState(() {
+          _loading = false;
+          if (b == null) {
+            _notFound = 'Барбер ${widget.id} не найден';
+            return;
+          }
+          _original = b;
+          _fullName.text = b.fullName;
+          _birthYear.text = '${b.birthYear}';
+          _branchId = b.branchId;
+        });
+      });
+    }
   }
 
   @override
-  void didUpdateWidget(BarbersScreen oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.query != widget.query) _sync();
+  void dispose() {
+    _fullName.dispose();
+    _birthYear.dispose();
+    super.dispose();
   }
-
-  void _sync() {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) context.read<BarberListNotifier>().applyQuery(widget.query);
-    });
-  }
-
-  void _go(BarberQuery next) => context.go(next.location);
 
   @override
   Widget build(BuildContext context) {
     final notifier = context.watch<BarberListNotifier>();
-    final q = widget.query;
-
-    return AppScaffold(
-      title: 'Барберы',
-      body: EntityListView<Barber, BarberQuery>(
-        notifier: notifier,
-        filters: Wrap(
-          spacing: 12,
-          runSpacing: 12,
-          crossAxisAlignment: WrapCrossAlignment.center,
-          children: [
-            DebouncedTextField(
-              label: 'Поиск по ФИО',
-              value: q.search,
-              onChanged: (v) => _go(q.copyWith(search: v)),
-            ),
-            FilterChip(
-              label: const Text('Показывать удалённые'),
-              selected: q.includeDeleted,
-              onSelected: (v) => _go(q.copyWith(includeDeleted: v)),
-            ),
-            TextButton(
-              onPressed: () => _go(BarberQuery(size: q.size)),
-              child: const Text('Сбросить'),
-            ),
+    final branches = notifier.branches.where(
+      (b) => b.deletedAt == null || b.id == _branchId,
+    );
+    return EntityForm(
+      title: widget.isEditing ? 'Изменение барбера' : 'Новый барбер',
+      backPath: '/barbers',
+      loading: _loading,
+      notFound: _notFound,
+      fields: (errors) => [
+        TextFieldSpec(
+          label: 'ФИО',
+          controller: _fullName,
+          validator: all([notEmpty, minLength(5), maxLength(100)]),
+        ),
+        TextFieldSpec(
+          label: 'Год рождения',
+          controller: _birthYear,
+          number: true,
+          validator: all([notEmpty, intRange(1950, DateTime.now().year - 18)]),
+        ),
+        DropdownButtonFormField<int>(
+          initialValue: branches.any((b) => b.id == _branchId)
+              ? _branchId
+              : null,
+          decoration: const InputDecoration(
+            labelText: 'Филиал',
+            border: OutlineInputBorder(),
+          ),
+          items: [
+            for (final b in branches)
+              DropdownMenuItem(value: b.id, child: Text(b.name)),
           ],
+          onChanged: (v) => _branchId = v,
+          validator: (v) => v == null ? 'Выберите филиал' : null,
         ),
-        sortField: q.sortField,
-        sortAscending: q.sortAscending,
-        size: q.size,
-        onSort: (field) => _go(
-          q.copyWith(
-            sortField: field,
-            sortAscending: field == q.sortField ? !q.sortAscending : true,
+      ],
+      onSave: () async {
+        await notifier.save(
+          Barber(
+            id: widget.id ?? 0,
+            fullName: _fullName.text.trim(),
+            birthYear: int.parse(_birthYear.text.trim()),
+            branchId: _branchId!,
+            deletedAt: _original?.deletedAt,
           ),
-        ),
-        onPage: (page) => _go(q.copyWith(page: page)),
-        onSize: (size) => _go(q.copyWith(size: size)),
-        nameOf: (b) => b.fullName,
-        pathOf: (b) => '/barbers/${b.id}',
-        columns: [
-          TableColumnSpec(
-            label: '№',
-            sortField: 'id',
-            numeric: true,
-            build: (b) => Text('${b.id}'),
-          ),
-          TableColumnSpec(
-            label: 'ФИО',
-            sortField: 'fullName',
-            build: (b) => Text(b.fullName),
-          ),
-          TableColumnSpec(
-            label: 'Год рождения',
-            sortField: 'birthYear',
-            numeric: true,
-            build: (b) => Text('${b.birthYear}'),
-          ),
-        ],
-      ),
+        );
+        return {};
+      },
     );
   }
 }
