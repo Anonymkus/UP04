@@ -16,7 +16,8 @@ services:
     runtime: static
     rootDir: barbershop_web6
     buildCommand: >-
-      git clone --depth 1 -b 3.47.7 https://github.com/flutter/flutter.git $HOME/flutter &&
+      ([ -x $HOME/flutter/bin/flutter ] || (rm -rf $HOME/flutter &&
+      git clone --depth 1 -b 3.47.7 https://github.com/flutter/flutter.git $HOME/flutter)) &&
       $HOME/flutter/bin/flutter build web --release
       --dart-define=API_BASE_URL=https://barbershop-api-1oh4.onrender.com/api &&
       find build/web -name '*.js.symbols' -delete
