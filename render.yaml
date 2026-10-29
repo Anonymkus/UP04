@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: barbershop-api
+    runtime: node
+    plan: free
+    rootDir: barbershop_web6/server
+    buildCommand: echo "Зависимостей нет"
+    startCommand: node mock-server.js
+    healthCheckPath: /api/__health
+    envVars:
+      - key: ORIGIN
+        value: https://barbershop-web.onrender.com
+
+  - type: web
+    name: barbershop-web
+    runtime: static
+    rootDir: barbershop_web6
+    buildCommand: >-
+      git clone --depth 1 -b 3.47.7 https://github.com/flutter/flutter.git $HOME/flutter &&
+      $HOME/flutter/bin/flutter build web --release
+      --dart-define=API_BASE_URL=https://barbershop-api.onrender.com/api &&
+      find build/web -name '*.js.symbols' -delete
+    staticPublishPath: ./build/web
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
