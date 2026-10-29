@@ -9,7 +9,7 @@ services:
     healthCheckPath: /api/__health
     envVars:
       - key: ORIGIN
-        value: https://barbershop-web.onrender.com
+        value: https://barbershop-web-28qh.onrender.com
 
   - type: web
     name: barbershop-web
@@ -18,7 +18,7 @@ services:
     buildCommand: >-
       git clone --depth 1 -b 3.47.7 https://github.com/flutter/flutter.git $HOME/flutter &&
       $HOME/flutter/bin/flutter build web --release
-      --dart-define=API_BASE_URL=https://barbershop-api.onrender.com/api &&
+      --dart-define=API_BASE_URL=https://barbershop-api-1oh4.onrender.com/api &&
       find build/web -name '*.js.symbols' -delete
     staticPublishPath: ./build/web
     routes:
