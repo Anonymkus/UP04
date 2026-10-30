@@ -649,7 +649,40 @@ async function handle(req, res, url) {
   return fail(res, 404, `Адрес ${method} ${path} не обслуживается`);
 }
 
-seed();
+// ───────────────────────── хранение в Supabase ─────────────────────────
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const useSupabase = Boolean(SUPABASE_URL && SUPABASE_KEY);
+const STATE_URL = `${SUPABASE_URL}/rest/v1/app_state`;
+
+function supabaseHeaders() {
+  const headers = { apikey: SUPABASE_KEY, 'Content-Type': 'application/json' };
+  if (SUPABASE_KEY.split('.').length === 3) headers.Authorization = `Bearer ${SUPABASE_KEY}`;
+  return headers;
+}
+
+async function loadState() {
+  const response = await fetch(`${STATE_URL}?id=eq.1&select=data`, { headers: supabaseHeaders() });
+  if (!response.ok) throw new Error(`Supabase: ${response.status} ${await response.text()}`);
+  const rows = await response.json();
+  if (!rows.length) return false;
+  db = { ...rows[0].data, refreshTokens: new Set(rows[0].data.refreshTokens || []) };
+  return true;
+}
+
+async function saveState() {
+  const data = { ...db, refreshTokens: [...db.refreshTokens] };
+  const response = await fetch(STATE_URL, {
+    method: 'POST',
+    headers: { ...supabaseHeaders(), Prefer: 'resolution=merge-duplicates' },
+    body: JSON.stringify([{ id: 1, data, updated_at: new Date().toISOString() }]),
+  });
+  if (!response.ok) console.error(`Supabase: не удалось сохранить (${response.status}) ${await response.text()}`);
+}
+
+let saving = Promise.resolve();
+const persist = () => (saving = saving.then(saveState).catch((e) => console.error(e)));
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -670,18 +703,33 @@ const server = http.createServer(async (req, res) => {
     console.error(err);
     if (!res.headersSent) fail(res, 500, 'Внутренняя ошибка сервера: ' + err.message);
   }
+  if (useSupabase && req.method !== 'GET' && res.statusCode < 400) persist();
   console.log(`${req.method.padEnd(6)} ${url.pathname}${url.search}  → ${res.statusCode}  ${Date.now() - started} мс`);
 });
 
-server.listen(PORT, () => {
-  console.log('');
-  console.log('  Учебное API «Барбершоп»');
-  console.log(`  Адрес:                http://localhost:${PORT}/api`);
-  console.log(`  Разрешённый источник: ${ORIGIN}`);
-  console.log(`  Срок жизни токена:    ${ACCESS_TTL} с`);
-  console.log('  Учётные записи:       admin/admin123  manager/manager123  client/client123');
-  console.log('  Сброс данных:         POST /api/__reset');
-  console.log('  Задержка ответа:      ?__delay=1500');
-  console.log('  Ошибка по требованию: ?__fail=500');
-  console.log('');
+async function start() {
+  if (useSupabase && !(await loadState())) {
+    seed();
+    await saveState();
+  } else if (!useSupabase) {
+    seed();
+  }
+  server.listen(PORT, () => {
+    console.log('');
+    console.log('  Учебное API «Барбершоп»');
+    console.log(`  Адрес:                http://localhost:${PORT}/api`);
+    console.log(`  Разрешённый источник: ${ORIGIN}`);
+    console.log(`  Срок жизни токена:    ${ACCESS_TTL} с`);
+    console.log('  Учётные записи:       admin/admin123  manager/manager123  client/client123');
+    console.log('  Сброс данных:         POST /api/__reset');
+    console.log('  Задержка ответа:      ?__delay=1500');
+    console.log('  Ошибка по требованию: ?__fail=500');
+    console.log(`  Хранение данных:      ${useSupabase ? 'Supabase (таблица app_state)' : 'в памяти'}`);
+    console.log('');
+  });
+}
+
+start().catch((err) => {
+  console.error('Не удалось запустить сервер:', err.message);
+  process.exit(1);
 });
