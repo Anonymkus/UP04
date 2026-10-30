@@ -650,39 +650,182 @@ async function handle(req, res, url) {
 }
 
 // ───────────────────────── хранение в Supabase ─────────────────────────
+// Данные лежат в связанных таблицах (схема — supabase-schema.sql).
+// При запуске сервер читает таблицы, после каждого изменения
+// отправляет в Supabase только изменившиеся строки.
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const useSupabase = Boolean(SUPABASE_URL && SUPABASE_KEY);
-const STATE_URL = `${SUPABASE_URL}/rest/v1/app_state`;
 
-function supabaseHeaders() {
+async function rest(method, table, query, body) {
   const headers = { apikey: SUPABASE_KEY, 'Content-Type': 'application/json' };
   if (SUPABASE_KEY.split('.').length === 3) headers.Authorization = `Bearer ${SUPABASE_KEY}`;
-  return headers;
+  if (method === 'POST') headers.Prefer = 'resolution=merge-duplicates,return=minimal';
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/${table}${query}`, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw new Error(`Supabase ${method} ${table}: ${response.status} ${await response.text()}`);
+  }
+  return method === 'GET' ? response.json() : null;
+}
+
+// Порядок важен: родительские таблицы раньше дочерних
+const TABLES = [
+  {
+    name: 'branches',
+    key: ['id'],
+    rows: () => db.branches.map((b) => ({ id: b.id, name: b.name, address: b.address, deleted_at: b.deletedAt })),
+  },
+  {
+    name: 'services',
+    key: ['id'],
+    rows: () =>
+      db.services.map((s) => ({
+        id: s.id, name: s.name, price: s.price, duration: s.duration, deleted_at: s.deletedAt,
+      })),
+  },
+  {
+    name: 'clients',
+    key: ['id'],
+    rows: () =>
+      db.clients.map((c) => ({
+        id: c.id, full_name: c.fullName, phone: c.phone, email: c.email, deleted_at: c.deletedAt,
+      })),
+  },
+  {
+    name: 'client_cards',
+    key: ['client_id'],
+    rows: () => db.clients.map((c) => ({ client_id: c.id, number: c.card.number, discount: c.card.discount })),
+  },
+  {
+    name: 'barbers',
+    key: ['id'],
+    rows: () =>
+      db.barbers.map((b) => ({
+        id: b.id, full_name: b.fullName, birth_year: b.birthYear, branch_id: b.branchId, deleted_at: b.deletedAt,
+      })),
+  },
+  {
+    name: 'users',
+    key: ['id'],
+    rows: () =>
+      db.users.map((u) => ({
+        id: u.id, username: u.username, password_hash: u.passwordHash, full_name: u.fullName,
+        role: u.role, client_id: u.clientId, deleted_at: u.deletedAt,
+      })),
+  },
+  {
+    name: 'appointments',
+    key: ['id'],
+    rows: () =>
+      db.appointments.map((a) => ({
+        id: a.id, client_id: a.clientId, barber_id: a.barberId, date: a.date, price: a.price,
+        deleted_at: a.deletedAt,
+      })),
+  },
+  {
+    name: 'appointment_services',
+    key: ['appointment_id', 'service_id'],
+    rows: () =>
+      db.appointments.flatMap((a) => a.serviceIds.map((s) => ({ appointment_id: a.id, service_id: s }))),
+  },
+  {
+    name: 'refresh_tokens',
+    key: ['token'],
+    rows: () => [...db.refreshTokens].map((token) => ({ token })),
+  },
+];
+
+const saved = new Map();
+const keyOf = (table, row) => table.key.map((k) => row[k]).join('|');
+const snapshot = (table) => new Map(table.rows().map((r) => [keyOf(table, r), JSON.stringify(r)]));
+
+async function saveChanges() {
+  const current = new Map(TABLES.map((t) => [t.name, snapshot(t)]));
+
+  // Удаления — от дочерних таблиц к родительским
+  for (const table of [...TABLES].reverse()) {
+    const now = current.get(table.name);
+    for (const [key, json] of saved.get(table.name) || []) {
+      if (now.has(key)) continue;
+      const row = JSON.parse(json);
+      const filter = table.key.map((k) => `${k}=eq.${encodeURIComponent(row[k])}`).join('&');
+      await rest('DELETE', table.name, `?${filter}`);
+    }
+  }
+
+  // Новые и изменённые строки — от родительских к дочерним
+  for (const table of TABLES) {
+    const before = saved.get(table.name) || new Map();
+    const changed = [...current.get(table.name)]
+      .filter(([key, json]) => before.get(key) !== json)
+      .map(([, json]) => JSON.parse(json));
+    if (changed.length) await rest('POST', table.name, `?on_conflict=${table.key.join(',')}`, changed);
+  }
+
+  for (const [name, snap] of current) saved.set(name, snap);
 }
 
 async function loadState() {
-  const response = await fetch(`${STATE_URL}?id=eq.1&select=data`, { headers: supabaseHeaders() });
-  if (!response.ok) throw new Error(`Supabase: ${response.status} ${await response.text()}`);
-  const rows = await response.json();
-  if (!rows.length) return false;
-  db = { ...rows[0].data, refreshTokens: new Set(rows[0].data.refreshTokens || []) };
+  const data = {};
+  for (const table of TABLES) data[table.name] = await rest('GET', table.name, '?select=*');
+  if (!data.users.length) return false;
+
+  const byId = (a, b) => a.id - b.id;
+  const cards = new Map(data.client_cards.map((c) => [c.client_id, c]));
+  const servicesOf = new Map();
+  for (const r of data.appointment_services) {
+    servicesOf.set(r.appointment_id, [...(servicesOf.get(r.appointment_id) || []), r.service_id]);
+  }
+
+  db = {
+    seq: {},
+    branches: data.branches
+      .map((b) => ({ id: b.id, name: b.name, address: b.address, deletedAt: b.deleted_at }))
+      .sort(byId),
+    services: data.services
+      .map((s) => ({ id: s.id, name: s.name, price: s.price, duration: s.duration, deletedAt: s.deleted_at }))
+      .sort(byId),
+    clients: data.clients
+      .map((c) => ({
+        id: c.id, fullName: c.full_name, phone: c.phone, email: c.email,
+        card: { number: cards.get(c.id)?.number ?? '', discount: cards.get(c.id)?.discount ?? 0 },
+        deletedAt: c.deleted_at,
+      }))
+      .sort(byId),
+    barbers: data.barbers
+      .map((b) => ({
+        id: b.id, fullName: b.full_name, birthYear: b.birth_year, branchId: b.branch_id, deletedAt: b.deleted_at,
+      }))
+      .sort(byId),
+    users: data.users
+      .map((u) => ({
+        id: u.id, username: u.username, passwordHash: u.password_hash, fullName: u.full_name,
+        role: u.role, clientId: u.client_id, deletedAt: u.deleted_at,
+      }))
+      .sort(byId),
+    appointments: data.appointments
+      .map((a) => ({
+        id: a.id, clientId: a.client_id, barberId: a.barber_id,
+        serviceIds: (servicesOf.get(a.id) || []).sort((x, y) => x - y),
+        date: a.date, price: a.price, deletedAt: a.deleted_at,
+      }))
+      .sort(byId),
+    refreshTokens: new Set(data.refresh_tokens.map((r) => r.token)),
+  };
+  for (const name of ['branches', 'services', 'clients', 'barbers', 'users', 'appointments']) {
+    db.seq[name] = db[name].reduce((max, x) => Math.max(max, x.id), 0);
+  }
+  for (const table of TABLES) saved.set(table.name, snapshot(table));
   return true;
 }
 
-async function saveState() {
-  const data = { ...db, refreshTokens: [...db.refreshTokens] };
-  const response = await fetch(STATE_URL, {
-    method: 'POST',
-    headers: { ...supabaseHeaders(), Prefer: 'resolution=merge-duplicates' },
-    body: JSON.stringify([{ id: 1, data, updated_at: new Date().toISOString() }]),
-  });
-  if (!response.ok) console.error(`Supabase: не удалось сохранить (${response.status}) ${await response.text()}`);
-}
-
 let saving = Promise.resolve();
-const persist = () => (saving = saving.then(saveState).catch((e) => console.error(e)));
+const persist = () => (saving = saving.then(saveChanges).catch((e) => console.error(e.message)));
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -708,11 +851,11 @@ const server = http.createServer(async (req, res) => {
 });
 
 async function start() {
-  if (useSupabase && !(await loadState())) {
+  if (!useSupabase) {
     seed();
-    await saveState();
-  } else if (!useSupabase) {
+  } else if (!(await loadState())) {
     seed();
+    await saveChanges();
   }
   server.listen(PORT, () => {
     console.log('');
@@ -724,7 +867,7 @@ async function start() {
     console.log('  Сброс данных:         POST /api/__reset');
     console.log('  Задержка ответа:      ?__delay=1500');
     console.log('  Ошибка по требованию: ?__fail=500');
-    console.log(`  Хранение данных:      ${useSupabase ? 'Supabase (таблица app_state)' : 'в памяти'}`);
+    console.log(`  Хранение данных:      ${useSupabase ? 'Supabase (связанные таблицы)' : 'в памяти'}`);
     console.log('');
   });
 }
